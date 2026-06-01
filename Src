@@ -1,1 +1,152 @@
+package com.dataengineering.retail
 
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.functions._
+
+object RetailSalesPipeline {
+
+  def main(args: Array[String]): Unit = {
+
+    val spark = SparkSession.builder()
+      .appName("Retail Sales Analytics Pipeline")
+      .getOrCreate()
+
+    import spark.implicits._
+
+    // Read Source Data
+    val retailSalesDF = spark.read
+      .option("header", "true")
+      .option("inferSchema", "true")
+      .csv("s3://retail-data/input/retail_sales.csv")
+
+    // Add Audit Columns
+    val salesWithAuditDF = retailSalesDF
+      .withColumn("ingestion_timestamp", current_timestamp())
+
+    salesWithAuditDF.write
+      .format("delta")
+      .mode("overwrite")
+      .saveAsTable("sales_audit")
+
+    // Data Cleansing
+    val cleansedSalesDF = salesWithAuditDF
+      .dropDuplicates("order_id")
+      .na.fill("UNKNOWN", Seq("state", "category"))
+      .filter(col("quantity") > 0)
+      .filter(col("unit_price") > 0)
+      .withColumn(
+        "sales_amount",
+        col("quantity") * col("unit_price")
+      )
+
+    cleansedSalesDF.write
+      .format("delta")
+      .mode("overwrite")
+      .saveAsTable("sales_cleaned")
+
+    // Apply Business Rules
+    val enrichedSalesDF = cleansedSalesDF
+      .withColumn(
+        "discount_pct",
+        when(col("sales_amount") > 500, 0.15)
+          .when(col("sales_amount") > 200, 0.10)
+          .otherwise(0.05)
+      )
+      .withColumn(
+        "net_sales",
+        col("sales_amount") * (lit(1) - col("discount_pct"))
+      )
+
+    enrichedSalesDF.write
+      .format("delta")
+      .mode("overwrite")
+      .saveAsTable("sales_enriched")
+
+    // Create Temp View
+    enrichedSalesDF.createOrReplaceTempView("retail_sales")
+
+    // Product Revenue Summary
+    val productRevenueDF = spark.sql(
+      """
+        SELECT
+            product_id,
+            category,
+            SUM(quantity) AS total_quantity_sold,
+            ROUND(SUM(net_sales),2) AS total_revenue
+        FROM retail_sales
+        GROUP BY product_id, category
+      """
+    )
+
+    productRevenueDF.write
+      .format("delta")
+      .mode("overwrite")
+      .saveAsTable("product_revenue_summary")
+
+    // State Revenue Summary
+    val stateRevenueDF = spark.sql(
+      """
+        SELECT
+            state,
+            ROUND(SUM(net_sales),2) AS state_revenue
+        FROM retail_sales
+        GROUP BY state
+      """
+    )
+
+    stateRevenueDF.write
+      .format("delta")
+      .mode("overwrite")
+      .saveAsTable("state_revenue_summary")
+
+    // Monthly Revenue Summary
+    val monthlyRevenueDF = spark.sql(
+      """
+        SELECT
+            YEAR(order_date) AS sales_year,
+            MONTH(order_date) AS sales_month,
+            ROUND(SUM(net_sales),2) AS monthly_revenue
+        FROM retail_sales
+        GROUP BY
+            YEAR(order_date),
+            MONTH(order_date)
+      """
+    )
+
+    monthlyRevenueDF.write
+      .format("delta")
+      .mode("overwrite")
+      .saveAsTable("monthly_revenue_summary")
+
+    // Customer Segmentation
+    val customerSegmentDF = spark.sql(
+      """
+        SELECT
+            customer_id,
+            ROUND(SUM(net_sales),2) AS customer_revenue,
+            CASE
+                WHEN SUM(net_sales) > 5000 THEN 'PLATINUM'
+                WHEN SUM(net_sales) > 2000 THEN 'GOLD'
+                ELSE 'SILVER'
+            END AS customer_segment
+        FROM retail_sales
+        GROUP BY customer_id
+      """
+    )
+
+    customerSegmentDF.write
+      .format("delta")
+      .mode("overwrite")
+      .saveAsTable("customer_segmentation")
+
+    // Data Quality Metrics
+    val sourceRecordCount = retailSalesDF.count()
+    val cleanedRecordCount = cleansedSalesDF.count()
+
+    println(s"Source Record Count : $sourceRecordCount")
+    println(s"Valid Record Count  : $cleanedRecordCount")
+    println(s"Rejected Records    : ${sourceRecordCount - cleanedRecordCount}")
+
+    spark.stop()
+  }
+}
